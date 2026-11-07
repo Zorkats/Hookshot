@@ -372,7 +372,10 @@ struct Targets {
 struct PipeEntry {
     std::atomic<bool> ready{false};
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};   // (a fast-linked one first, the worker's full build over it)
+    // (hookshot) when its job was queued, started and ended (steady clock, ns): a draw's wait for it, told apart as queued or built
+    std::atomic<int64_t> t_queued{0}, t_started{0}, t_ended{0};
 };
+int64_t steady_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
 // (hookshot) skips by the line that made them, reported with the frame statistics (draw_skip_report)
@@ -601,11 +604,14 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     };
     auto job = std::make_shared<Job>();
     job->e = e, job->p = &p, job->s = s, job->at = at, job->topo = topo;
+    e->t_queued = steady_ns();
     jobs_push([job] {
+        job->e->t_started = steady_ns();
         // (over a linked one, which is left alone: draws recorded with it may still be on their way)
         if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
+        job->e->t_ended = steady_ns();
         job->e->ready.store(true, std::memory_order_release);
-    });
+    }, false, &e->ready);
     return e;
 }
 
@@ -2678,17 +2684,8 @@ void exposure_log_dump(const char* why) {
     logf("%s", line);
 }
 
-void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
-    PROF(PROF_DRAW);
-    VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    if (!d.mesh && !topology(d.prim, topo)) {
-        static int logged[32];
-        if (d.prim >= 0 && d.prim < 32 && logged[d.prim]++ < 2) logf("vk: draws of NVN primitive %d are left out", d.prim);
-        SKIP_HERE();
-    }
-    const Targets at = bare_targets(s, targets(s));
-    if (!at.width || !at.height) SKIP_HERE();
-    uint8_t types[8];
+/// The fragment outputs' types the targets' formats ask for (a program is translated for them)
+void color_types_of(const Targets& at, uint8_t types[8]) {
     for (int i = 0; i < 8; i++) {
         const VkFormat f = i < at.n ? at.color_format[i] : VK_FORMAT_UNDEFINED;
         switch (f) {
@@ -2705,6 +2702,20 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         default: types[i] = (uint8_t)Shader::AttributeType::Float; break;
         }
     }
+}
+
+void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    PROF(PROF_DRAW);
+    VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    if (!d.mesh && !topology(d.prim, topo)) {
+        static int logged[32];
+        if (d.prim >= 0 && d.prim < 32 && logged[d.prim]++ < 2) logf("vk: draws of NVN primitive %d are left out", d.prim);
+        SKIP_HERE();
+    }
+    const Targets at = bare_targets(s, targets(s));
+    if (!at.width || !at.height) SKIP_HERE();
+    uint8_t types[8];
+    color_types_of(at, types);
     const Program* cp;
     {
         PROF(PROF_PROGRAM);
@@ -2749,15 +2760,26 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // RX_VK_PIPE_SKIP=1: left out when its targets hold an earlier frame's picture, as before)
     static const bool always_wait = getenv("RX_VK_PIPE_SKIP") == nullptr;
     const bool may_skip = !always_wait && targets_persistent(at);
-    auto wait_for = [&](const std::atomic<bool>& ready) {
+    auto wait_for = [&](const std::atomic<bool>& ready, const PipeEntry* pe) {
+        PROF(PROF_SHADERWAIT);
         const auto t0 = std::chrono::steady_clock::now();
+        const int pending = jobs_pending();
         jobs_wait(ready);
         st_waits++;
-        st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        st_wait_ms += ms;
+        static std::atomic<int> told{0};   // (hookshot) a long wait: for what, and (a pipeline) how long it was queued and built
+        if (ms >= 20.0 && told++ < 80) {
+            if (pe)
+                logf("vk: a draw waited %.0f ms for a pipeline of program %016llx (%d jobs pending): queued %.0f ms, built in %.0f ms",
+                     ms, (unsigned long long)cp->key, pending, (pe->t_started - pe->t_queued) / 1e6, (pe->t_ended - pe->t_started) / 1e6);
+            else
+                logf("vk: a draw waited %.0f ms for program %016llx to translate (%d jobs pending)", ms, (unsigned long long)cp->key, pending);
+        }
     };
     if (!cp->ready.load(std::memory_order_acquire)) {
         if (may_skip) return void(st_pending_skips++);
-        wait_for(cp->ready);
+        wait_for(cp->ready, nullptr);
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
     if (cp->failed) SKIP_HERE();
@@ -2773,7 +2795,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
         if (may_skip) return void(st_pending_skips++);
-        wait_for(pe->ready);
+        wait_for(pe->ready, pe);
     }
     const VkPipeline pl = pe->pipeline;
     if (!pl) SKIP_HERE();
@@ -3438,12 +3460,17 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         if (memory_read_as_submitted(indirect, g, 12)) s.grid[0] = g[0], s.grid[1] = g[1], s.grid[2] = g[2];
     }
     const uint8_t types[8]{};
-    const Program* cp = program_for(s, ProgramKind::Compute, types);
+    const Program* cp;
+    {
+        PROF(PROF_PROGRAM);   // (hookshot: a compute program not met before is translated here)
+        cp = program_for(s, ProgramKind::Compute, types);
+    }
     dclock.t_prog = std::chrono::steady_clock::now();
     // (a program still being translated is waited for, as a draw's is: a dispatch left out is work never done again.
     // MKW updates its terrain height clipmaps a region at a time as the camera moves, and makes its sky's tables
     // once; a skipped update left holes and flat patches in the terrain, garbage in the sky)
     if (cp && !cp->ready.load(std::memory_order_acquire)) {
+        PROF(PROF_SHADERWAIT);
         const auto t0 = std::chrono::steady_clock::now();
         jobs_wait(cp->ready);
         st_waits++;
@@ -3607,7 +3634,11 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
     }
     const uint8_t types[8]{};
     const Program* p = program_for(s, ProgramKind::Compute, types);
-    if (!p || !p->ready.load(std::memory_order_acquire) || p->failed) return;
+    if (p && !p->ready.load(std::memory_order_acquire)) {   // (hookshot: compute translates as a job now; its marks need it)
+        PROF(PROF_SHADERWAIT);
+        jobs_wait(p->ready);
+    }
+    if (!p || p->failed) return;
     for (const Stage& st : p->stages)
         for (const auto& d : st.info.image_descriptors) {
             if (!d.is_written) continue;
@@ -3620,6 +3651,19 @@ void dry_mark_written(NvnState& s, bool compute, bool first) {
                     texture_written(tex);
             }
         }
+}
+
+// (hookshot) RX_VK_NO_PREFETCH=1: off. The dry pass meets every draw of a submission before the segments record any: a
+// graphics program not met before is queued for translation here, so the workers translate a new area's programs side
+// by side while the dry pass goes on, instead of each segment finding them one draw at a time and waiting on each
+void dry_prefetch(NvnState& s) {
+    static const bool off = getenv("RX_VK_NO_PREFETCH") != nullptr;
+    if (off || !s.has_prog) return;
+    const Targets at = bare_targets(s, targets(s));
+    if (!at.width || !at.height) return;
+    uint8_t types[8];
+    color_types_of(at, types);
+    program_for(s, ProgramKind::Graphics, types);
 }
 
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipes) {

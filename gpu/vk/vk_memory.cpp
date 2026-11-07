@@ -997,7 +997,9 @@ void bg_main() {
     }
 }
 
-/// The imports the thread made, into the table (pools_mu held); one already there makes the new one redundant
+/// The imports made outside pools_mu, into the table (pools_mu held): one takes the place of the imported pools inside
+/// it (retired); one an imported pool covers, or that only part of one overlaps (made meanwhile by another thread), is
+/// redundant and given back, and a lookup that needs it makes its import under the lock, as before
 void bg_drain() {
     std::vector<std::pair<uint64_t, Pool>> ready;
     {
@@ -1005,41 +1007,158 @@ void bg_drain() {
         if (bg_ready.empty()) return;
         ready.swap(bg_ready);
     }
+    std::vector<uint64_t> inside;
     for (auto& [lo, p] : ready) {
-        auto imp = imported.find(lo);
-        if (imp != imported.end() && imp->second.hi >= p.hi) {
+        (void)lo;
+        bool keep = true;
+        inside.clear();
+        auto it = imported.lower_bound(p.hi);   // (the pools starting below its end, the last ones first)
+        while (it != imported.begin()) {
+            --it;
+            if (it->second.hi <= p.lo) {
+                if (it->second.hi + (1ull << 30) < p.lo) break;   // (imports are at most 1 GB: none further down reaches it)
+                continue;
+            }
+            if (it->second.lo < p.lo || it->second.hi > p.hi || (it->second.lo == p.lo && it->second.hi == p.hi)) {
+                keep = false;
+                break;
+            }
+            inside.push_back(it->first);
+        }
+        if (!keep) {
             vkDestroyBuffer(dev.device, p.buffer, nullptr);
             vkFreeMemory(dev.device, p.memory, nullptr);
             continue;
         }
-        if (imp != imported.end()) retire_pool(imp);
-        imported.emplace(lo, p);
+        for (uint64_t k : inside) retire_pool(imported.find(k));
+        imported.emplace(p.lo, p);
     }
+}
+
+/// The range an import for the guest pool `range` covers: its 16 MB chunks (RX_VK_IMPORT_CHUNK_MB), widened over every
+/// imported pool it overlaps (listed in `overlapped`, to be retired: the imported pools stay disjoint). A range crossing
+/// a chunk's end made the chunk's pool again, larger, over the next chunk, whose own pool stayed: two mirrors of the
+/// same memory. MKW's GPU culling wrote its instance data (a 2.4 MB storage buffer) through one, the draws read it
+/// through the other, synced from guest memory before the submission's write-back: the instances of a frame before or
+/// older, objects popping in and out, one-frame flashes. pools_mu held.
+uint64_t import_chunk() {
+    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : 16) << 20;
+    return chunk;
+}
+void import_span(const GuestPool& range, std::map<uint64_t, Pool>::iterator imp, uint64_t& lo, uint64_t& hi,
+                 std::vector<uint64_t>& overlapped) {
+    const uint64_t chunk = import_chunk();
+    const uint64_t want_lo = chunk ? range.lo & ~(chunk - 1) : range.lo;
+    const uint64_t want_hi = chunk ? (range.hi + chunk - 1) & ~(chunk - 1) : range.hi;
+    lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
+    for (bool grew = true; grew;) {
+        grew = false;
+        overlapped.clear();
+        auto it = imported.lower_bound(hi);   // (the pools starting below hi, the last ones first)
+        while (it != imported.begin()) {
+            --it;
+            if (it->second.hi <= lo) {
+                if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
+                continue;
+            }
+            overlapped.push_back(it->first);
+            if (it->second.lo < lo) lo = it->second.lo, grew = true;
+            if (it->second.hi > hi) hi = it->second.hi, grew = true;
+        }
+    }
+    if (hi - lo > (1ull << 30)) {   // (no larger than 1 GB: then as before, the chunk's pool alone, overlaps logged)
+        static int logged_big;
+        if (logged_big++ < 8)
+            logf("vk: pool %#llx..%#llx would take in %zu pools, %llu MB: left overlapping", (unsigned long long)lo,
+                 (unsigned long long)hi, overlapped.size(), (unsigned long long)((hi - lo) >> 20));
+        lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
+        overlapped.clear();
+        if (imp != imported.end()) overlapped.push_back(imp->first);
+    }
+}
+
+/// The guest pool holding [guest, guest + size) and the imported pool covering it (imported.end(): none yet); false:
+/// in no guest pool. pools_mu held.
+bool pool_find(uint64_t guest, uint64_t size, GuestPool& range, std::map<uint64_t, Pool>::iterator& imp) {
+    if (guest_pools.empty()) return false;
+    auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), guest,
+                               [](uint64_t a, const GuestPool& p) { return a < p.lo; });
+    if (it == guest_pools.begin()) return false;
+    --it;
+    if (guest < it->lo || guest + size > it->hi) return false;
+    range = *it;
+    const uint64_t chunk = import_chunk();
+    imp = imported.end();
+    if (chunk) {
+        auto c = imported.upper_bound(range.lo);
+        if (c != imported.begin() && (--c)->second.lo <= range.lo && c->second.hi >= range.hi) imp = c;
+        if (imp == imported.end()) imp = imported.find(range.lo & ~(chunk - 1));   // (a smaller one there: made again, larger)
+    } else {
+        imp = imported.find(range.lo);
+    }
+    return true;
+}
+
+void log_import(const GuestPool& range, std::chrono::steady_clock::time_point t0, bool unlocked) {
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    static std::mutex mu;
+    std::lock_guard lk(mu);
+    static double total_ms;
+    static int n, logged;
+    total_ms += ms, n++;
+    if ((ms >= 2.0 && logged++ < 30) || n % 256 == 0)
+        logf("vk: pool %#llx+%#llx imported in %.1f ms%s (%d imports, %.0f ms in all)", (unsigned long long)range.lo,
+             (unsigned long long)(range.hi - range.lo), ms, unlocked ? " outside the locks" : "", n, total_ms);
+}
+
+/// The import a lookup of [guest, guest + size) would make, made now, before the caller takes the parallel replay's
+/// lock and pools_mu (taken here only to look): an import takes 5-130 ms in the driver, and one made under those locks
+/// stopped every recording thread (~1.1 s of the warm route's slow submits). Handed to the lookup in bg_ready, as the
+/// background imports were; a thread that wants a range under way waits for it here, without the locks.
+/// RX_VK_IMPORT_UNLOCKED=0: made under the locks, as before.
+void pool_prepare(uint64_t guest, uint64_t size) {
+    static const bool on = !getenv("RX_VK_IMPORT_UNLOCKED") || atoi(getenv("RX_VK_IMPORT_UNLOCKED"));
+    if (!on || !par_active.load(std::memory_order_relaxed)) return;
+    GuestPool range;
+    uint64_t lo, hi;
+    {
+        std::lock_guard lk(pools_mu);
+        if (last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) return;
+        bg_drain();
+        std::map<uint64_t, Pool>::iterator imp;
+        if (!pool_find(guest, size, range, imp)) return;
+        if (imp != imported.end() && imp->second.lo <= range.lo && imp->second.hi >= range.hi) return;
+        std::vector<uint64_t> overlapped;
+        import_span(range, imp, lo, hi, overlapped);
+    }
+    {
+        std::unique_lock lk(bg_mu);
+        if (std::find(bg_inflight.begin(), bg_inflight.end(), range.lo) != bg_inflight.end()) {
+            bg_done_cv.wait(lk, [&] { return std::find(bg_inflight.begin(), bg_inflight.end(), range.lo) == bg_inflight.end(); });
+            return;
+        }
+        bg_inflight.push_back(range.lo);
+    }
+    Pool p;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = import_pool(lo, hi, p);
+    log_import(range, t0, true);
+    std::lock_guard lk(bg_mu);
+    if (ok) bg_ready.push_back({p.lo, p});
+    std::erase(bg_inflight, range.lo);
+    bg_done_cv.notify_all();
 }
 
 Pool* pool_lookup(uint64_t guest, uint64_t size) {
     if (guest_pools.empty()) return nullptr;
     bg_drain();
-    auto it = std::upper_bound(guest_pools.begin(), guest_pools.end(), guest,
-                               [](uint64_t a, const GuestPool& p) { return a < p.lo; });
-    if (it == guest_pools.begin()) return nullptr;
-    --it;
-    if (guest < it->lo || guest + size > it->hi) return nullptr;
-    const GuestPool range = *it;
     // (imports by 16 MB chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as
     // their number grew, and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
-    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : 16) << 20;
-    auto covering = [&]() {
-        auto c = imported.upper_bound(range.lo);
-        if (c == imported.begin()) return imported.end();
-        --c;
-        return c->second.lo <= range.lo && c->second.hi >= range.hi ? c : imported.end();
-    };
-    auto imp = chunk ? covering() : imported.find(range.lo);
-    const uint64_t want_lo = chunk ? range.lo & ~(chunk - 1) : range.lo;
-    const uint64_t want_hi = chunk ? (range.hi + chunk - 1) & ~(chunk - 1) : range.hi;
-    if (chunk && imp == imported.end()) imp = imported.find(want_lo);   // (a smaller one there: made again, larger)
-    if (imp == imported.end() || imp->second.hi < range.hi) {   // (under way in the background: waited for)
+    GuestPool range;
+    std::map<uint64_t, Pool>::iterator imp;
+    if (!pool_find(guest, size, range, imp)) return nullptr;
+    auto missing = [&] { return imp == imported.end() || imp->second.hi < range.hi || imp->second.lo > range.lo; };
+    if (missing()) {   // (under way on another thread: waited for)
         bool waited = false;
         {
             std::unique_lock lk(bg_mu);
@@ -1053,53 +1172,17 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
         }
         if (waited) {
             bg_drain();
-            imp = imported.find(range.lo);
+            pool_find(guest, size, range, imp);
         }
     }
-    if (imp == imported.end() || imp->second.hi < range.hi || imp->second.lo > range.lo) {
-        // (the new pool takes in every imported pool its range overlaps, and they are retired: the imported pools stay
-        // disjoint. A range crossing a chunk's end made the chunk's pool again, larger, over the next chunk, whose own
-        // pool stayed: two mirrors of the same memory. MKW's GPU culling wrote its instance data (a 2.4 MB storage
-        // buffer) through one, the draws read it through the other, synced from guest memory before the submission's
-        // write-back: the instances of a frame before or older, objects popping in and out, one-frame flashes.)
-        uint64_t lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
+    if (missing()) {
+        uint64_t lo, hi;
         std::vector<uint64_t> overlapped;
-        for (bool grew = true; grew;) {
-            grew = false;
-            overlapped.clear();
-            auto it = imported.lower_bound(hi);   // (the pools starting below hi, the last ones first)
-            while (it != imported.begin()) {
-                --it;
-                if (it->second.hi <= lo) {
-                    if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
-                    continue;
-                }
-                overlapped.push_back(it->first);
-                if (it->second.lo < lo) lo = it->second.lo, grew = true;
-                if (it->second.hi > hi) hi = it->second.hi, grew = true;
-            }
-        }
-        if (hi - lo > (1ull << 30)) {   // (no larger than 1 GB: then as before, the chunk's pool alone, overlaps logged)
-            static int logged_big;
-            if (logged_big++ < 8)
-                logf("vk: pool %#llx..%#llx would take in %zu pools, %llu MB: left overlapping", (unsigned long long)lo,
-                     (unsigned long long)hi, overlapped.size(), (unsigned long long)((hi - lo) >> 20));
-            lo = want_lo, hi = std::max(want_hi, imp != imported.end() ? imp->second.hi : 0);
-            overlapped.clear();
-            if (imp != imported.end()) overlapped.push_back(imp->first);
-        }
+        import_span(range, imp, lo, hi, overlapped);
         Pool p;
         const auto t0 = std::chrono::steady_clock::now();
         const bool ok = import_pool(lo, hi, p);
-        {
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            static double total_ms;
-            static int n, logged;
-            total_ms += ms, n++;
-            if ((ms >= 2.0 && logged++ < 30) || n % 256 == 0)
-                logf("vk: pool %#llx+%#llx imported in %.1f ms (%d imports, %.0f ms in all)", (unsigned long long)range.lo,
-                     (unsigned long long)(range.hi - range.lo), ms, n, total_ms);
-        }
+        log_import(range, t0, false);
         if (!ok) {
             if (failures++ < 16)
                 logf("vk: pool %#llx+%#llx not imported", (unsigned long long)range.lo,
@@ -1291,6 +1374,19 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
 
+bool gpu_buffer_imported(uint64_t gpu, uint64_t size) {
+    uint64_t avail = 0;
+    if (!host->gpu_ptr(gpu, &avail) || avail < size) return false;
+    const uint64_t guest = host->gpu_guest(gpu);
+    std::lock_guard lk(pools_mu);
+    if (last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) return true;
+    bg_drain();
+    GuestPool range;
+    std::map<uint64_t, Pool>::iterator imp;
+    return pool_find(guest, size, range, imp) && imp != imported.end() && imp->second.lo <= range.lo &&
+           imp->second.hi >= range.hi;
+}
+
 void memory_pool_created(uint64_t gpu, uint64_t size) {
     // (RX_VK_BG_IMPORT=1 only: imported eagerly, every pool the game made, most never used by the GPU, the thread's
     // page locking stalled the game's threads (3-7 fps); chunked imports at first use are the default)
@@ -1364,6 +1460,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
             return {p->mirror, off, size, 0};
     }
+    pool_prepare(guest, size);   // (a pool not imported yet: imported first, without the locks)
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
     Pool* p = pool_of(guest, size);

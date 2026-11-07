@@ -67,6 +67,7 @@ struct BufferRef {
 bool memory_init();                                   // vk_memory.cpp
 void memory_sync();                                   // (at each submit: pools the game made or let go)
 BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool holds the range)
+bool gpu_buffer_imported(uint64_t gpu, uint64_t size);   // (its pool is imported already: gpu_buffer imports none)
 /// A range as a binding of the replay sees it: the pool's VRAM mirror when it has one (vk_memory.cpp), else the
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
@@ -192,7 +193,7 @@ void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 // ---- a scoped timer per phase of the replay (logged per frame with the frame statistics) ----
 namespace mkwvk {
 enum ProfPhase { PROF_SUBMIT, PROF_PRESENT, PROF_DRAW, PROF_DESC, PROF_TEXGET, PROF_UPLOAD, PROF_PIPE, PROF_PROGRAM,
-                 PROF_CMDS, PROF_DISPATCH, PROF_MEMSYNC, PROF_QSUBMIT, PROF_SLOTWAIT, PROF_COUNT };
+                 PROF_CMDS, PROF_DISPATCH, PROF_MEMSYNC, PROF_QSUBMIT, PROF_SLOTWAIT, PROF_SHADERWAIT, PROF_COUNT };
 extern int64_t prof_ns[PROF_COUNT];
 inline int64_t prof_now() {
     LARGE_INTEGER t;

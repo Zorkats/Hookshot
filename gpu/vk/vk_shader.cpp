@@ -1231,7 +1231,7 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     jobs_push([job] {
         translate_mesh_into(*job->p, job->s, job->has_task ? &job->task : nullptr, job->mesh,
                             job->has_prim ? &job->prim : nullptr, job->has_fs ? &job->fs : nullptr, job->ct);
-    });
+    }, false, &raw->ready);
     return raw;
 }
 
@@ -1373,22 +1373,30 @@ const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t c
     Program* raw = p.get();
     variants.push_back(std::move(p));
     static const bool sync = getenv("RX_VK_SYNC_SHADERS") != nullptr;
-    if (compute || sync) {   // (compute: dispatches are never left out, so they are translated where they are)
+    if (sync) {
         translate_into(*raw, s, stage_code[0], stage_code[1], compute ? stage_code[5] : nullptr, color_types);
         return raw->failed ? nullptr : raw;
     }
+    // (hookshot) compute too is a job, urgent: dispatches are never left out, so their callers wait for it at once (and
+    // run it themselves, jobs_wait), but no longer under shader_mu, which every other program lookup and the game's
+    // program releases queued on for as long as a big compute shader took to translate
     struct Job {
         Program* p;
         NvnState s;
-        Code vs, fs;
-        bool has_fs;
+        Code vs, fs, cs;
+        bool has_vs, has_fs;
         uint8_t ct[8];
     };
     auto job = std::make_shared<Job>();
-    job->p = raw, job->s = s, job->vs = *stage_code[0], job->has_fs = stage_code[1] != nullptr;
+    job->p = raw, job->s = s, job->has_vs = stage_code[0] != nullptr, job->has_fs = stage_code[1] != nullptr;
+    if (job->has_vs) job->vs = *stage_code[0];
     if (job->has_fs) job->fs = *stage_code[1];
+    if (compute) job->cs = *stage_code[5];
     std::memcpy(job->ct, color_types, 8);
-    jobs_push([job] { translate_into(*job->p, job->s, &job->vs, job->has_fs ? &job->fs : nullptr, nullptr, job->ct); });
+    jobs_push([job] {
+        translate_into(*job->p, job->s, job->has_vs ? &job->vs : nullptr, job->has_fs ? &job->fs : nullptr,
+                       job->p->compute ? &job->cs : nullptr, job->ct);
+    }, compute, &raw->ready);
     return raw;
 }
 

@@ -692,6 +692,11 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     default: return false;
     }
     if (!unswizzle_ready()) return false;
+    // (a pool not imported yet: the CPU unswizzles it. Its import took 30-350 ms in the driver (OoT's 2.4 GB texture
+    // pool, for a 21 MB texture: 345 ms of a 728 ms submission), the CPU a few ms; a pool a buffer binding imports
+    // later is unswizzled here from then on. RX_VK_UNSWIZZLE_IMPORTS=1: imported, as before)
+    static const bool imports = getenv("RX_VK_UNSWIZZLE_IMPORTS") && atoi(getenv("RX_VK_UNSWIZZLE_IMPORTS"));
+    if (!imports && !gpu_buffer_imported(tex.gpu, total)) return false;
     const BufferRef src = gpu_buffer(tex.gpu, total);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;

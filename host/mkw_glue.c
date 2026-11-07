@@ -480,6 +480,48 @@ static DWORD WINAPI watch_thread(void *p) {
         hos_log("watch: done");
     }
 }
+/* (the threads sampled: the game's by their names, the renderer's by their descriptions. Rescanned every 2 s while
+   sampling (a scan stops the sampling for ~50 ms), for those that start late, as the renderer's replay and shader
+   workers do at the first load) */
+enum { SAMPLE_MAXT = 128 };
+static HANDLE sample_th[SAMPLE_MAXT];
+static DWORD sample_tid[SAMPLE_MAXT];
+static char sample_tn[SAMPLE_MAXT][64];
+static int sample_nt;
+static int sample_scan(void) {
+    static HANDLE gh[1024];
+    static const char *gn[1024];
+    const int ng = hos_thread_handles(gh, gn, 1024);
+    int added = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = {sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && sample_nt < SAMPLE_MAXT; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        int known = 0;
+        for (int i = 0; i < sample_nt && !known; i++) known = sample_tid[i] == te.th32ThreadID;
+        if (known) continue;
+        char name[64] = "";
+        for (int i = 0; i < ng; i++)
+            if (GetThreadId(gh[i]) == te.th32ThreadID) { snprintf(name, sizeof name, "%s", gn[i]); break; }
+        HANDLE h = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (!name[0]) {
+            PWSTR d = NULL;
+            char desc[64] = "";
+            if (SUCCEEDED(GetThreadDescription(h, &d)) && d) WideCharToMultiByte(CP_UTF8, 0, d, -1, desc, sizeof desc, NULL, NULL);
+            if (d) LocalFree(d);
+            if (!strncmp(desc, "mkw_vk", 6)) snprintf(name, sizeof name, "%s", desc);
+        }
+        if (!name[0]) { CloseHandle(h); continue; }
+        for (char *q = name; *q; q++) if (*q == ' ' || *q == '|') *q = '_';
+        sample_th[sample_nt] = h;
+        sample_tid[sample_nt] = te.th32ThreadID;
+        snprintf(sample_tn[sample_nt], sizeof sample_tn[sample_nt], "%s", name);
+        sample_nt++, added++;
+    }
+    CloseHandle(snap);
+    return added;
+}
 static DWORD WINAPI sample_all_thread(void *p) {
     const char *path = (const char *)p;
     char go[MAX_PATH];
@@ -488,11 +530,9 @@ static DWORD WINAPI sample_all_thread(void *p) {
     static HMODULE mods[64];
     static char modname[64][64];
     int nmods = 0;
-    enum { MAXT = 128 };
-    static HANDLE th[MAXT];
-    static char tn[MAXT][64];
-    int nt = 0;
-    int64_t t0 = 0;
+    HANDLE *th = sample_th;
+    char (*tn)[64] = sample_tn;
+    int64_t t0 = 0, scanned = 0;
     for (;;) {
         if (GetFileAttributesA(go) == INVALID_FILE_ATTRIBUTES) {
             if (out) { fclose(out); out = NULL; hos_log("prof: all-thread sampling stopped"); }
@@ -502,37 +542,17 @@ static DWORD WINAPI sample_all_thread(void *p) {
         if (!out) {
             out = fopen(path, "a");
             if (!out) { Sleep(1000); continue; }
-            for (int i = 0; i < nt; i++) CloseHandle(th[i]);
-            nt = 0;
-            static HANDLE gh[1024];
-            static const char *gn[1024];
-            const int ng = hos_thread_handles(gh, gn, 1024);
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            THREADENTRY32 te = {sizeof te};
-            for (BOOL ok = Thread32First(snap, &te); ok && nt < MAXT; ok = Thread32Next(snap, &te)) {
-                if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
-                char name[64] = "";
-                for (int i = 0; i < ng; i++)
-                    if (GetThreadId(gh[i]) == te.th32ThreadID) { snprintf(name, sizeof name, "%s", gn[i]); break; }
-                HANDLE h = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
-                if (!h) continue;
-                if (!name[0]) {
-                    PWSTR d = NULL;
-                    char desc[64] = "";
-                    if (SUCCEEDED(GetThreadDescription(h, &d)) && d) WideCharToMultiByte(CP_UTF8, 0, d, -1, desc, sizeof desc, NULL, NULL);
-                    if (d) LocalFree(d);
-                    if (!strncmp(desc, "mkw_vk", 6)) snprintf(name, sizeof name, "%s", desc);
-                }
-                if (!name[0]) { CloseHandle(h); continue; }
-                for (char *q = name; *q; q++) if (*q == ' ' || *q == '|') *q = '_';
-                th[nt] = h;
-                snprintf(tn[nt], sizeof tn[nt], "%s", name);
-                nt++;
-            }
-            CloseHandle(snap);
-            t0 = hos_now_ns();
-            hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
+            for (int i = 0; i < sample_nt; i++) CloseHandle(sample_th[i]);
+            sample_nt = 0;
+            sample_scan();
+            t0 = scanned = hos_now_ns();
+            hos_log("prof: all-thread sampling of %d threads into %s", sample_nt, path);
         }
+        if (hos_now_ns() - scanned > 2000000000) {
+            scanned = hos_now_ns();
+            if (sample_scan()) hos_log("prof: all-thread sampling: now %d threads", sample_nt);
+        }
+        const int nt = sample_nt;
         Sleep(2);
         const long ms = (long)((hos_now_ns() - t0) / 1000000);
         for (int i = 0; i < nt; i++) {

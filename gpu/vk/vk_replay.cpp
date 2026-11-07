@@ -832,6 +832,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (dry) {
                 const bool compute = h.op == NOP_DISPATCH || h.op == NOP_DISPATCH_INDIRECT;
                 if (s.render_enabled && (compute || !s.raster_discard)) dry_mark_written(s, compute, dry_work == 0);
+                if (s.render_enabled && !compute && h.op != NOP_DRAW_MESH) dry_prefetch(s);
                 if (++dry_work % 64 == 0) par_points.push_back({p + h.size, s, ub_updates.size(), par_conds.size(), dry_work});
             } else if (!worker) {
                 maybe_split(cmd);
@@ -1185,7 +1186,7 @@ void bench_frame(int64_t presents) {
          sorted[sorted.size() / 2], sorted.front(), sum / times, sorted.back());
     static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups", "uploads",
                                             "pipelines", "programs", "commands", "dispatch", "memory sync",
-                                            "queue submit", "slot wait"};
+                                            "queue submit", "slot wait", "shader wait"};
     char line[600];
     int n = snprintf(line, sizeof line, "vk: bench: a replay's time (ms):");
     for (int i = 2; i < PROF_COUNT; i++)
@@ -1207,7 +1208,7 @@ struct SlowWatch {
         logged++;
         static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups",
                                                 "uploads", "pipelines", "programs", "commands", "dispatch",
-                                                "memory sync", "queue submit", "slot wait"};
+                                                "memory sync", "queue submit", "slot wait", "shader wait"};
         char line[600];
         int k = snprintf(line, sizeof line, "vk: slow %s: %.1f ms:", what, ms);
         for (int i = 2; i < PROF_COUNT; i++) {
@@ -1866,7 +1867,7 @@ void log_frame_stats() {
         {
             static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups",
                                                     "uploads", "pipelines", "programs", "commands", "dispatch",
-                                                    "memory sync", "queue submit", "slot wait"};
+                                                    "memory sync", "queue submit", "slot wait", "shader wait"};
             static int64_t last[PROF_COUNT];
             char line[600];
             int n = snprintf(line, sizeof line, "vk: a frame's replay time (ms):");
