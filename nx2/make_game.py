@@ -25,6 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = [sys.executable, "-I"]
 BUILD_ID = "e0f3ccfa"   # (the version the patches, the hot list and the profile were made from)
+ROMFS_READER = "unpacked by nup.py, stored sizes"   # (in <out>/.hookshot_romfs: change it when nup.py would write a file differently)
 BESIDE = ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "wgpu_native.dll"]
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
@@ -194,20 +195,23 @@ def main():
     say("stage", "read", "Reading your game files")
     shutil.rmtree(exefs, ignore_errors=True)
     if a.nup:
-        # (what an earlier build left is not kept without a reason to trust it: builders before the compressed .nup fix wrote those files as
-        # they lay, so a folder they left held broken game data, and the game crashed at start over its empty dictionaries)
-        game = os.path.join(out, ".game")
-        good = os.path.join(out, ".hookshot_romfs")
-        shutil.rmtree(game, ignore_errors=True)
-        if not os.path.exists(good):
+        # (a romfs folder is kept only when this reader wrote it: builders before the compressed .nup fix wrote packed files as they lay,
+        # and the game crashed at start over its empty dictionaries; later ones unpacked three .bcul.zs files the game wants packed, at
+        # the right size, so no resume would have mended them. The mark goes down before the first file: an interrupted extraction picks
+        # up where it stopped, each file written whole or not at all)
+        mark = os.path.join(out, ".hookshot_romfs")
+        have = ""
+        if os.path.exists(mark):
+            with open(mark, encoding="utf-8") as f:
+                have = f.read().strip()
+        if have != ROMFS_READER:
             shutil.rmtree(romfs, ignore_errors=True)
-        run(PY + ["nx2/nup.py", a.nup, "--extract", game])
-        shutil.move(os.path.join(game, "exefs"), exefs)
-        if not os.path.isdir(romfs):
-            shutil.move(os.path.join(game, "romfs"), romfs)
-        shutil.rmtree(game, ignore_errors=True)
-        with open(good, "w") as f:
-            f.write("unpacked by this builder" + chr(10))
+            os.makedirs(romfs)
+            with open(mark, "w", encoding="utf-8") as f:
+                f.write(ROMFS_READER + chr(10))
+        shutil.rmtree(os.path.join(out, ".game"), ignore_errors=True)   # (where older builders unpacked the whole package first)
+        run(PY + ["nx2/nup.py", a.nup, "--extract", work, "--only", "exefs"])
+        run(PY + ["nx2/nup.py", a.nup, "--extract", out, "--only", "romfs"])   # (straight into the game folder: a rebuild checks sizes, not 26 GB)
         check_modules(exefs)
     else:
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)

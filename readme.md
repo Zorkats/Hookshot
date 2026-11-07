@@ -91,8 +91,13 @@ A build takes about 40 minutes, and you can use your PC in the meantime.
 
 To build from the command line you also need:
 
-- Python 3 with `lz4`, `numpy`, `capstone` and `unicorn`.
-- The clang from [emsdk](https://github.com/emscripten-core/emsdk), at `C:\emsdk`.
+- Python 3 with `lz4`, `numpy`, `capstone` and `unicorn`, and `zstandard` to read a `.nup` (Python 3.14 or newer has
+  this built in).
+- The clang from [emsdk](https://github.com/emscripten-core/emsdk), at `C:\emsdk` or wherever `EMSDK` points.
+- A CPM package cache with `vulkanheaders`, `spirv-headers` and FFmpeg, as `cpm/` in this folder or wherever `RX_CPM`
+  points. The build stops without it.
+- A [wgpu-native](https://github.com/gfx-rs/wgpu-native) release, as `wgpu-native/` in this folder or wherever
+  `WGPU_NATIVE` points. Without it the game builds with no fallback for PCs that lack Vulkan.
 - Visual Studio 2022 with .NET 8, only if you want to change the builder itself.
 - The prebuilt tools that go in `third_party/`: `a64emit`, `lld-link`, `zbic` and SDL2.
 

@@ -53,9 +53,12 @@ GPU = os.path.join(kit.HERE, "..", "gpu")
 # FFmpeg (libavcodec's VP8/VP9 decoders, swscale) for nn::codec's video decoders (host/nn_video.c): the static build
 # in the Eglantine clone's package cache
 FFMPEG = None   # (found in the CPM caches below, once cpm_dirs is defined)
-# the renderer's WebGPU: a wgpu-native release (include/, lib/); TOTKPort's build of it by default
-WGPU = os.environ.get("WGPU_NATIVE", os.path.join(os.path.expanduser("~"), "Desktop", "TOTKPort", "third_party",
-                                                  "wgpu-native"))
+# the renderer's WebGPU: a wgpu-native release (include/, lib/). WGPU_NATIVE, else wgpu-native/ in this folder (where the builder
+# package keeps it), else TOTKPort's build of it
+WGPU = os.environ.get("WGPU_NATIVE") or next(
+    (d for d in (os.path.join(kit.ROOT, "wgpu-native"),
+                 os.path.join(os.path.expanduser("~"), "Desktop", "TOTKPort", "third_party", "wgpu-native"))
+     if os.path.isdir(d)), os.path.join(kit.ROOT, "wgpu-native"))
 
 
 def gpu_sources():
@@ -106,10 +109,10 @@ def vk_sources():
 
 
 def cpm_dirs():
-    """Eden's CPM package caches, read only: RX_CPM, this project's work/eg clone, mkw-recomp's, the shared
-    Eglantine checkout's (Vulkan and SPIR-V headers, VMA, FFmpeg)"""
+    """Eden's CPM package caches, read only: RX_CPM, cpm/ in this folder (where the builder package keeps it), this project's
+    work/eg clone, mkw-recomp's, the shared Eglantine checkout's (Vulkan and SPIR-V headers, VMA, FFmpeg)"""
     eden_ns2 = os.path.dirname(kit.ROOT)
-    return [d for d in (os.environ.get("RX_CPM"), os.path.join(kit.WORK, "eg", ".cache", "cpm"),
+    return [d for d in (os.environ.get("RX_CPM"), os.path.join(kit.ROOT, "cpm"), os.path.join(kit.WORK, "eg", ".cache", "cpm"),
                         os.path.join(eden_ns2, "mkw-recomp", "work", "eg", ".cache", "cpm"),
                         os.path.join(eden_ns2, "Eglantine", ".cache", "cpm")) if d and os.path.isdir(d)]
 
@@ -314,6 +317,11 @@ def main():
     # the Vulkan back end, a DLL of its own (RX_BACKEND=vulkan): built when the Vulkan headers are in the CPM cache
     vk_jobs = []
     vk_headers, spirv_headers = cpm_package("vulkanheaders"), cpm_package("spirv-headers")
+    if a.standalone and not a.only and not (vk_headers and spirv_headers):
+        # (without them the game linked and ran on the WebGPU fallback alone, and nothing said why)
+        raise SystemExit("error: the Vulkan and SPIR-V headers were not found, so hookshot_vk.dll cannot be built. Point RX_CPM at a CPM "
+                         "package cache that has vulkanheaders/ and spirv-headers/, or put one at %s. Searched: %s" % (
+                             os.path.join(kit.ROOT, "cpm"), ", ".join(cpm_dirs()) or "no cache found"))
     if a.standalone and not a.only and vk_headers and spirv_headers:
         cxx = toolchain.need(toolchain.find("clang++"))
         vk = os.path.join(GPU, "vk")

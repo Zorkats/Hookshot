@@ -13,9 +13,10 @@ The layout (worked out from the file; little-endian):
            32-byte hash, 16 bytes 0
     then   the child list, u32 each: a node index; below the dir count a dir, else (index - dirs) a file
     then   the name strings (not 0-terminated)
-The data of a file is stored as is at its data offset, or, in .nup files from newer dumpers, as a zstd frame whose content is the
-file: its size field is then the size of the file, not of the frame (seen on rtld: 10524 bytes in the listing, frame content 10524).
-A file that is itself zstd in the game (the romfs .zs files) is not one of those: its frame's content is larger than the file.
+The data of a file is stored as is at its data offset, or, in .nup files from newer dumpers, as one zstd frame whose content is the
+file. The record says which: its first size is the file's, the second the bytes stored. They differ only for a packed file (on one
+package, exactly its 40,588 packed files, each second size reaching the next file's data). The frame header alone cannot tell: three
+of the game's own .bcul.zs files state a content size equal to their file size.
 """
 import argparse
 import os
@@ -25,6 +26,21 @@ import sys
 
 
 ZSTD = b"\x28\xb5\x2f\xfd"
+
+
+def zstd_decompressor():
+    """A streaming zstd decompressor and its error type: the zstandard package, or Python 3.14's own compression.zstd"""
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj(), zstandard.ZstdError
+    except ImportError:
+        pass
+    try:
+        from compression import zstd
+        return zstd.ZstdDecompressor(), zstd.ZstdError
+    except ImportError:
+        raise SystemExit("this .nup keeps files compressed: install the zstandard package (python -m pip install zstandard), or use "
+                         "Python 3.14 or newer")
 
 
 def frame_content_size(head):
@@ -88,68 +104,42 @@ class Nup:
                 r = self.files[k - self.nd]
                 yield prefix + self.name(r[0], r[1]), r
 
-    def inner_is_zstd(self, r):
-        """Whether what this frame holds is itself a zstd frame"""
-        import zstandard
-        self.f.seek(r[3])
-        try:
-            return zstandard.ZstdDecompressor().decompressobj().decompress(self.f.read(min(r[2], 1 << 20)))[:4] == ZSTD
-        except zstandard.ZstdError:   # (made with one of the game's dictionaries: the game's own file)
-            return False
-
     def is_packed(self, r, name=""):
-        """A file the package keeps compressed. A frame that states no size is tried: it is the file when it unpacks to the listed size.
-        A .zs file is zstd in the game too, and three of them happen to hold exactly as much as they take: that one is packed only if
-        what it holds is zstd again"""
+        """A file the package keeps compressed: its stored size is not its size. Anything else stored that way is a layout this
+        reader does not know, said instead of guessed"""
+        if r[4] == r[2]:
+            return False
         self.f.seek(r[3])
         head = self.f.read(18)
-        if head[:4] != ZSTD:
-            return False
         size = frame_content_size(head)
-        if name.endswith(".zs") and (size is None or size == r[2]):
-            return size == r[2] and self.inner_is_zstd(r)
-        if size is not None:
-            return size == r[2]
-        import zstandard
-        self.f.seek(r[3])
-        d = zstandard.ZstdDecompressor().decompressobj()
-        got = 0
-        left = r[2]
-        try:
-            while left and got <= r[2] and not d.eof:
-                b = self.f.read(min(left, 1 << 20))
-                if not b:
-                    break
-                left -= len(b)
-                got += len(d.decompress(b))
-        except zstandard.ZstdError:
-            return False
-        return got == r[2]
+        if head[:4] != ZSTD or size not in (None, r[2]):
+            raise SystemExit("%s: stored as %d bytes for %d, but not as a zstd frame of the file (it starts %s)" % (
+                name or "a file", r[4], r[2], head[:8].hex()))
+        return True
 
     def copy_to(self, r, g, name=""):
         """The file, as itself, into the open file g"""
         packed = self.is_packed(r, name)
         self.f.seek(r[3])
-        left = r[2]
         if packed:
-            left += 1 << 16   # (a frame of something that does not compress is a little larger than what it holds)
-            import zstandard
-            d = zstandard.ZstdDecompressor().decompressobj()
+            d, error = zstd_decompressor()
+            left = r[4]
             got = 0
-            while left and not getattr(d, "eof", False):
-                b = self.f.read(min(left, 8 << 20))
-                if not b:
-                    break
-                left -= len(b)
-                try:
+            try:
+                while left and not d.eof:
+                    b = self.f.read(min(left, 8 << 20))
+                    if not b:
+                        raise SystemExit("short read in the package")
+                    left -= len(b)
                     out = d.decompress(b)
-                except zstandard.ZstdError:   # (the end of the frame, and the next file's bytes after it)
-                    break
-                g.write(out)
-                got += len(out)
-            if got != r[2]:
-                raise SystemExit("a compressed file came out as %d bytes, %d expected" % (got, r[2]))
+                    g.write(out)
+                    got += len(out)
+            except error as e:
+                raise SystemExit("%s: its compressed data is damaged (%s)" % (name or "a file", e))
+            if got != r[2] or not d.eof:
+                raise SystemExit("%s: came out as %d bytes, %d expected" % (name or "a file", got, r[2]))
             return
+        left = r[2]
         while left:
             b = self.f.read(min(left, 8 << 20))
             if not b:
@@ -236,9 +226,9 @@ def main():
         print("title %d: %016x v%d  exefs %d files (%s)  romfs %d files, %.2f GB" % (
             t["index"], t["id"], t["version"], len(ex), ", ".join("%s %d" % (p, r[2]) for p, r in ex),
             len(ro), sum(r[2] for _, r in ro) / 1e9))
-        same = sum(1 for _, r in ro if r[2] != r[4])
-        if same:
-            print("  (%d romfs files with two different sizes)" % same)
+        packed = sum(1 for _, r in ex + ro if r[2] != r[4])
+        if packed:
+            print("  (%d files kept compressed in the package)" % packed)
     if a.extract:
         t = pick_title(nup, a.title)
         free = shutil.disk_usage(os.path.dirname(os.path.abspath(a.extract)) or ".").free
